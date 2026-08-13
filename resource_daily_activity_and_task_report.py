@@ -50,6 +50,22 @@ audit_sheet = None
 resource_type_map = {}
 SERVICE_ACCOUNT_EMAIL = ""
 AUDIT_LOG_TAB = "Run Errors"
+AUDIT_HISTORY_TAB = "Error History"
+AUDIT_LOG_HEADERS = [
+    "Run ID",
+    "Run Timestamp UTC",
+    "Project",
+    "ClickUp Status",
+    "ClickUp Task URL",
+    "Charter URL",
+    "Task Tracker URL",
+    "PDL",
+    "Delivery Lead",
+    "Reason Type",
+    "QAI ID",
+    "Charter Row",
+    "Issue",
+]
 LOCAL_RESOURCE_POOL_REFERENCE_SHEET = "Assign"
 DAILY_PROJECT_PROGRESS_SHEET = "Daily Project Progress"
 LATEST_MEMBER_STATUS_SHEET = "Latest Member Status"
@@ -313,6 +329,12 @@ def should_ignore_project_by_pdl_email(pdl_value):
 def classify_issue_type(issue):
     text = str(issue).strip().lower()
 
+    if "invalid qai id" in text:
+        return "invalid_qai_id_format"
+    if "qai id missing" in text:
+        return "missing_qai_id"
+    if "name missing" in text:
+        return "missing_name"
     if "quota" in text or "429" in text:
         return "quota_limit"
     if "not accessible" in text or "permission" in text or "share it with service account" in text:
@@ -340,7 +362,7 @@ def classify_issue_type(issue):
     if "failed to open" in text:
         return "sheet_open_failed"
 
-    return "other"
+    return "unclassified_issue"
 
 
 def safe_open_spreadsheet_by_url(url, project_name, all_errors, sheet_kind):
@@ -430,35 +452,83 @@ def write_audit_log(all_errors):
 
     rows = []
     run_time = datetime.now(timezone.utc).isoformat()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    seen_errors = set()
 
     for err in all_errors:
         project_name = str(err.get("project", "")).strip()
         context = project_audit_context.get(project_name, {})
         issue = str(err.get("issue", "")).strip()
+        reason_type = str(err.get("reason_type", "")).strip() or classify_issue_type(issue)
+        qai_id = clean_sheet_text(err.get("qai_id", ""))
+        charter_row = clean_sheet_text(err.get("charter_row", ""))
+        error_key = (project_name, reason_type, qai_id, charter_row, issue)
+        if error_key in seen_errors:
+            continue
+        seen_errors.add(error_key)
         rows.append({
+            "Run ID": run_id,
             "Run Timestamp UTC": run_time,
             "Project": project_name,
             "ClickUp Status": str(context.get("clickup_status", "")).strip(),
+            "ClickUp Task URL": clean_sheet_text(context.get("clickup_task_url", "")),
+            "Charter URL": clean_sheet_text(context.get("charter_url", "")),
+            "Task Tracker URL": clean_sheet_text(context.get("tracker_url", "")),
             "PDL": str(context.get("pdl", "")).strip(),
             "Delivery Lead": str(context.get("delivery_lead", "")).strip(),
-            "Reason Type": str(err.get("reason_type", "")).strip() or classify_issue_type(issue),
+            "Reason Type": reason_type,
+            "QAI ID": qai_id,
+            "Charter Row": charter_row,
             "Issue": issue,
         })
 
-    audit_df = pd.DataFrame(
-        rows,
-        columns=[
-            "Run Timestamp UTC",
-            "Project",
-            "ClickUp Status",
-            "PDL",
-            "Delivery Lead",
-            "Reason Type",
-            "Issue",
-        ]
-    )
+    audit_df = pd.DataFrame(rows, columns=AUDIT_LOG_HEADERS)
     upload(audit_df, audit_sheet, AUDIT_LOG_TAB)
-    log(f"📝 Audit log updated with {len(audit_df)} error row(s).")
+    if not audit_df.empty:
+        history_ws = get_or_create_worksheet(
+            audit_sheet,
+            AUDIT_HISTORY_TAB,
+            rows=1000,
+            cols=len(AUDIT_LOG_HEADERS),
+        )
+        ensure_worksheet_has_cols(history_ws, len(AUDIT_LOG_HEADERS))
+        history_values = read_worksheet_values(
+            history_ws,
+            project_name="Audit Sheet",
+            sheet_name=AUDIT_HISTORY_TAB,
+        )
+        history_header = (
+            [clean_sheet_text(value) for value in history_values[0]]
+            if history_values
+            else []
+        )
+        if not any(history_header):
+            history_ws.update("A1", [AUDIT_LOG_HEADERS])
+            existing_rows = 0
+        else:
+            existing_rows = len(history_values) - 1
+            if history_header != AUDIT_LOG_HEADERS:
+                # Preserve prior history while upgrading the log schema.
+                history_df = pd.DataFrame(history_values[1:], columns=history_header)
+                for column in AUDIT_LOG_HEADERS:
+                    if column not in history_df.columns:
+                        history_df[column] = ""
+                history_df = history_df[AUDIT_LOG_HEADERS]
+                upload(history_df, audit_sheet, AUDIT_HISTORY_TAB)
+                history_ws = audit_sheet.worksheet(AUDIT_HISTORY_TAB)
+                existing_rows = len(history_df)
+                log(f"ℹ️ Upgraded {AUDIT_HISTORY_TAB} to the current audit log columns.")
+
+        ensure_worksheet_has_rows(history_ws, existing_rows + len(audit_df) + 1)
+        history_ws.append_rows(
+            clean_sheet_rows(audit_df.astype(str).values.tolist()),
+            value_input_option="USER_ENTERED",
+            table_range="A1",
+        )
+    log(
+        f"📝 {AUDIT_LOG_TAB} updated with {len(audit_df)} unique error row(s); "
+        f"{AUDIT_HISTORY_TAB} appended for run {run_id}."
+    )
 
 
 def get_local_resource_pool_context(all_errors=None, project_name=""):
@@ -801,6 +871,11 @@ def batch_highlight_errors(spreadsheet, error_logs):
 # ============================================================
 
 QAI_ID_REGEX = re.compile(r"(QAI[\s_-]*[A-Z]{2,}\d+)", re.IGNORECASE)
+CHARTER_QAI_ID_POLICY_REGEX = re.compile(r"^QAI_[A-Z]{2}\d+$")
+
+def is_valid_charter_qai_id(value):
+    """Validate the exact QAI ID format required in Charter rows."""
+    return bool(CHARTER_QAI_ID_POLICY_REGEX.fullmatch(clean_sheet_text(value)))
 
 def normalize_qai_id(value):
     if value is None:
@@ -1267,11 +1342,25 @@ def find_missing_fields(project_name, fields_to_check):
     return errors
 
 
-def add_project_error(all_errors, project_name, issue):
-    all_errors.append({
+def add_project_error(
+    all_errors,
+    project_name,
+    issue,
+    reason_type="",
+    qai_id="",
+    charter_row="",
+):
+    error = {
         "project": project_name,
         "issue": issue,
-    })
+    }
+    if reason_type:
+        error["reason_type"] = reason_type
+    if qai_id:
+        error["qai_id"] = qai_id
+    if charter_row:
+        error["charter_row"] = charter_row
+    all_errors.append(error)
     log(f"⚠️ {project_name}: {issue}")
 
 
@@ -1286,7 +1375,7 @@ def get_qai_id_and_status_pair(charter_url, project_name, all_errors):
         sheet_kind="Charter sheet",
     )
     if sh is None:
-        return None, all_errors
+        return None, {}, all_errors
 
     ws = safe_get_worksheet(
         spreadsheet=sh,
@@ -1296,22 +1385,21 @@ def get_qai_id_and_status_pair(charter_url, project_name, all_errors):
         sheet_kind="Charter sheet",
     )
     if ws is None:
-        return None, all_errors
+        return None, {}, all_errors
 
     try:
         data = read_worksheet_values(
             ws,
-            range_name="A:E",
             project_name=project_name,
             sheet_name=CHARTER_TEAM_MEMBER_DETAILS_SHEET,
         )
     except RuntimeError as e:
         add_project_error(all_errors, project_name, str(e))
-        return None, all_errors
+        return None, {}, all_errors
     
     if not data or len(data) < 2:
         add_project_error(all_errors, project_name, "Charter sheet is empty")
-        return None, all_errors
+        return None, {}, all_errors
 
     # Extract header and rows from list of lists
     header = [str(h).strip() for h in data[0]]
@@ -1322,42 +1410,88 @@ def get_qai_id_and_status_pair(charter_url, project_name, all_errors):
     if missing_cols:
         for col in missing_cols:
             add_project_error(all_errors, project_name, f"Charter sheet column missing: {col}")
-        return None, all_errors
+        return None, {}, all_errors
 
     # Find column indices
     qai_id_idx = header.index("QAI ID")
     status_idx = header.index("Status")
     type_idx = header.index("Type")
+    name_idx = next(
+        (index for index, column in enumerate(header) if column.lower() in {"name", "full name"}),
+        None,
+    )
+    if name_idx is None:
+        add_project_error(
+            all_errors,
+            project_name,
+            "Charter sheet column missing: Name or Full Name. Project was not appended.",
+        )
+        return None, {}, all_errors
     
     qai_id_status_map = {}
+    qai_id_name_map = {}
 
     for row_num, row in enumerate(rows, start=2):  # start=2 → sheet row number
         qai_id = str(row[qai_id_idx] if qai_id_idx < len(row) else "").strip()
         status = str(row[status_idx] if status_idx < len(row) else "").strip()
         resource_type = str(row[type_idx] if type_idx < len(row) else "").strip()
+        full_name = clean_sheet_text(
+            row[name_idx] if name_idx is not None and name_idx < len(row) else ""
+        )
 
         if resource_type.lower() != "remote":
             continue
 
-        # QAI ID missing → error
+        # Invalid member rows must not reach the daily progress append.
         if not qai_id:
-            all_errors.append({
-                "project": project_name,
-                "issue": f"QAI ID missing at row {row_num}"
-            })
+            add_project_error(
+                all_errors,
+                project_name,
+                f"QAI ID missing at Charter row {row_num}; member skipped",
+                reason_type="missing_qai_id",
+                charter_row=row_num,
+            )
+            continue
+
+        if not is_valid_charter_qai_id(qai_id):
+            add_project_error(
+                all_errors,
+                project_name,
+                f"Invalid QAI ID '{qai_id}' at Charter row {row_num}; expected QAI_XX123 format; member skipped",
+                reason_type="invalid_qai_id_format",
+                qai_id=qai_id,
+                charter_row=row_num,
+            )
+            continue
+
+        if not full_name:
+            add_project_error(
+                all_errors,
+                project_name,
+                f"Name missing for QAI ID {qai_id} at Charter row {row_num}; member skipped",
+                reason_type="missing_name",
+                qai_id=qai_id,
+                charter_row=row_num,
+            )
             continue
 
         # Status missing → log but still store mapping
         if not status:
-            all_errors.append({
-                "project": project_name,
-                "issue": f"Status missing for QAI ID {qai_id}"
-            })
+            add_project_error(
+                all_errors,
+                project_name,
+                f"Status missing for QAI ID {qai_id}",
+                reason_type="missing_status",
+                qai_id=qai_id,
+                charter_row=row_num,
+            )
             qai_id_status_map[qai_id] = ""
         else:
             qai_id_status_map[qai_id] = status
 
-    return qai_id_status_map, all_errors
+        qai_id_name_map[qai_id] = full_name
+
+    return qai_id_status_map, qai_id_name_map, all_errors
 
 def get_bd_date():
     bd_tz = pytz.timezone("Asia/Dhaka")
@@ -1384,9 +1518,12 @@ def parse_tracker_date(value):
         return None
 
 
-def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_name, all_errors):
+def build_today_activity_report(
+    data, qai_id_status_map, qai_id_name_map, today_bd_date, project_name, all_errors
+):
     output_columns = [
         "QAI ID",
+        "Full Name",
         "Engagement (today)",
         "Charter Team Status",
         "Task Tracker Activity (today)",
@@ -1465,6 +1602,7 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
 
         out_rows.append({
             "QAI ID": qai,
+            "Full Name": clean_sheet_text(qai_id_name_map.get(qai, "")),
             "Engagement (today)": charter_status,
             "Charter Team Status": charter_status,
             "Task Tracker Activity (today)": "Yes" if tracker_activity_map.get(qai) else "",
@@ -1540,7 +1678,7 @@ def get_accuracy_from_dashboard(sh, dashboard_name, project_name, all_errors):
 
     return annotator_accuracy, reviewer_accuracy
 
-def get_tracker_data(qai_id_and_status_map, all_errors, project_name,tracker_url):
+def get_tracker_data(qai_id_and_status_map, qai_id_name_map, all_errors, project_name,tracker_url):
     dashboard_name = "Dashboard"
 
     current_date = get_bd_date()
@@ -1577,7 +1715,7 @@ def get_tracker_data(qai_id_and_status_map, all_errors, project_name,tracker_url
     data = worksheet_values_to_records(raw_values)
 
     activity_report_df = build_today_activity_report(
-        data, qai_id_and_status_map, current_date, project_name, all_errors
+        data, qai_id_and_status_map, qai_id_name_map, current_date, project_name, all_errors
     )
     if "QAI ID" not in activity_report_df.columns:
         add_project_error(
@@ -1778,7 +1916,9 @@ def build_daily_project_progress_rows(today_activity_df, member_lookup):
             "Start Date": clean_sheet_text(activity_row.get("Start Date", "")),
             "Ticket Status": clean_sheet_text(activity_row.get("Ticket Status", "")),
             "QAI ID": qai_id,
-            "Full Name": clean_sheet_text(member_info.get("Full Name", "")),
+            "Full Name": clean_sheet_text(
+                activity_row.get("Full Name", "") or member_info.get("Full Name", "")
+            ),
             "Email": clean_sheet_text(member_info.get("Email", "")),
             "Contact": clean_sheet_text(member_info.get("Contact", "")),
             "Client Alias": clean_sheet_text(activity_row.get("Client Alias", "")),
@@ -1930,6 +2070,27 @@ def refresh_latest_member_status_sheet(project_status_by_name=None, all_errors=N
                 axis=1,
             )
 
+            # Keep the current-status view complete without rewriting history.
+            member_lookup = get_member_reference_lookup(
+                all_errors=all_errors,
+                project_name="Local Resource Pool",
+            )
+            refreshed_contact_fields = 0
+            for row_index, row in latest_df.iterrows():
+                member_info = member_lookup.get(clean_sheet_text(row.get("QAI ID", "")), {})
+                for field_name in ("Email", "Contact"):
+                    if not clean_sheet_text(row.get(field_name, "")):
+                        replacement_value = clean_sheet_text(member_info.get(field_name, ""))
+                        if replacement_value:
+                            latest_df.at[row_index, field_name] = replacement_value
+                            refreshed_contact_fields += 1
+
+            if refreshed_contact_fields:
+                log(
+                    f"✅ Filled {refreshed_contact_fields} missing Email/Contact field(s) "
+                    f"in {LATEST_MEMBER_STATUS_SHEET} from {LOCAL_RESOURCE_POOL_REFERENCE_SHEET}."
+                )
+
     upload(latest_df, sh, LATEST_MEMBER_STATUS_SHEET)
     log(f"✅ Refreshed {LATEST_MEMBER_STATUS_SHEET} with {len(latest_df)} latest unique row(s).")
 
@@ -1968,6 +2129,7 @@ def main():
 
             project_audit_context[project_name] = {
                 "clickup_status": clickup_status,
+                "clickup_task_url": task.get("url", ""),
                 "pdl": pdl_email or pdl,
                 "delivery_lead": delivery_lead,
             }
@@ -1993,6 +2155,11 @@ def main():
                 if f.get("name") == "Client Alias":
                     client_alias = f.get("value") or ""
 
+            project_audit_context[project_name].update({
+                "charter_url": charter_url,
+                "tracker_url": tracker_url,
+            })
+
             fields_to_check = {
                 "charter_url": charter_url,
                 "tracker_url": tracker_url,
@@ -2008,8 +2175,9 @@ def main():
             )
 
             qai_id_and_status_map = None
+            qai_id_name_map = {}
             if charter_url:
-                qai_id_and_status_map, all_errors = get_qai_id_and_status_pair(
+                qai_id_and_status_map, qai_id_name_map, all_errors = get_qai_id_and_status_pair(
                     charter_url=charter_url,
                     project_name=project_name,
                     all_errors=all_errors
@@ -2039,6 +2207,7 @@ def main():
 
             activity_report_df = get_tracker_data(
                 qai_id_and_status_map,
+                qai_id_name_map,
                 all_errors,
                 project_name,
                 tracker_url,
