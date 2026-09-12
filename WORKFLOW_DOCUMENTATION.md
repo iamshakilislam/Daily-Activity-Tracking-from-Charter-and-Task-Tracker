@@ -183,6 +183,13 @@ Implementation detail:
 - if `QAI ID` is missing, that row is logged and skipped
 - if `Status` is missing, the row is still recorded in the map with an empty status so downstream logic can continue
 
+The workflow also reads columns A and B of the charter's `Project Delivery Plan` tab:
+
+- the column B value beside `Start Date` becomes `Start Date`
+- the column B value beside `Final Delivery Date:` becomes `Completion Date`
+
+Label matching ignores capitalization, surrounding whitespace, and punctuation such as the trailing colon.
+
 #### 8. Read tracker data
 
 If tracker data is available, `get_tracker_data()` opens the tracker spreadsheet and reads the `Datewise Summary` tab.
@@ -227,7 +234,8 @@ The generated activity dataframe is then augmented with:
 
 - `Client Alias`
 - `Project Name`
-- `Start Date`
+- `Start Date` (from the charter's `Project Delivery Plan` tab)
+- `Completion Date` (the charter's final delivery date)
 - `Task Tracker Link`
 - `Ticket Status`
 
@@ -251,6 +259,7 @@ Before append, the function also:
 
 - ensures the destination worksheet exists
 - expands row and column counts when needed
+- inserts `Completion Date` as a real sheet column after `Start Date` when upgrading the previous schema, so every existing downstream header and value shifts together
 - rewrites the sheet header if the existing headers do not match the canonical schema
 
 The local resource pool lookup expects at least these columns:

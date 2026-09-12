@@ -86,6 +86,7 @@ project_audit_context = {}
 
 TRACKER_SUMMARY_SHEET = "Datewise Summary"
 CHARTER_TEAM_MEMBER_DETAILS_SHEET = "Team Member Details"
+CHARTER_PROJECT_DELIVERY_PLAN_SHEET = "Project Delivery Plan"
 IGNORED_PDL_EMAILS = {
     "nayeem@quantigo.ai",
     "towfique@quantigo.ai",
@@ -110,6 +111,7 @@ DAILY_PROJECT_PROGRESS_HEADERS = [
     "Snapshot Time",
     "Project Name",
     "Start Date",
+    "Completion Date",
     "Ticket Status",
     "QAI ID",
     "Full Name",
@@ -124,6 +126,10 @@ DAILY_PROJECT_PROGRESS_HEADERS = [
     "Today Task Tracker Activity (QC)",
     "Annotation Accuracy (today)",
     "QC Accuracy (today)",
+]
+LEGACY_DAILY_PROJECT_PROGRESS_HEADERS = [
+    header for header in DAILY_PROJECT_PROGRESS_HEADERS
+    if header != "Completion Date"
 ]
 
 def normalize_service_account_json(value):
@@ -288,31 +294,6 @@ def get_custom_field_value(task, field_name):
         if field.get("name") == field_name:
             return normalize_field_value(field.get("value"))
     return ""
-
-
-def format_clickup_date_value(value):
-    if value in (None, ""):
-        return ""
-
-    text_value = str(value).strip()
-    if not text_value:
-        return ""
-
-    try:
-        timestamp = int(float(text_value))
-        if timestamp > 10**12:
-            timestamp = timestamp / 1000
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
-    except Exception:
-        return text_value
-
-
-def get_task_start_date(task):
-    task_start_date = format_clickup_date_value(task.get("start_date"))
-    if task_start_date:
-        return task_start_date
-
-    return format_clickup_date_value(get_custom_field_value(task, "Start Date"))
 
 
 def extract_emails(text):
@@ -1493,6 +1474,64 @@ def get_qai_id_and_status_pair(charter_url, project_name, all_errors):
 
     return qai_id_status_map, qai_id_name_map, all_errors
 
+
+def get_charter_project_dates(charter_url, project_name, all_errors):
+    """Read the project start and final delivery dates from the charter."""
+    sh = safe_open_spreadsheet_by_url(
+        url=charter_url,
+        project_name=project_name,
+        all_errors=all_errors,
+        sheet_kind="Charter sheet",
+    )
+    if sh is None:
+        return "", ""
+
+    ws = safe_get_worksheet(
+        spreadsheet=sh,
+        title=CHARTER_PROJECT_DELIVERY_PLAN_SHEET,
+        project_name=project_name,
+        all_errors=all_errors,
+        sheet_kind="Charter sheet",
+    )
+    if ws is None:
+        return "", ""
+
+    try:
+        data = read_worksheet_values(
+            ws,
+            range_name="A:B",
+            project_name=project_name,
+            sheet_name=CHARTER_PROJECT_DELIVERY_PLAN_SHEET,
+        )
+    except RuntimeError as e:
+        add_project_error(all_errors, project_name, str(e))
+        return "", ""
+
+    values_by_label = {}
+    for row in data:
+        label = _normalize_cell(row[0] if row else "")
+        value = clean_sheet_text(row[1] if len(row) > 1 else "")
+        if label and value and label not in values_by_label:
+            values_by_label[label] = value
+
+    start_date = values_by_label.get(_normalize_cell("Start Date"), "")
+    completion_date = values_by_label.get(_normalize_cell("Final Delivery Date"), "")
+
+    if not start_date:
+        add_project_error(
+            all_errors,
+            project_name,
+            f"Start Date missing in Charter sheet worksheet '{CHARTER_PROJECT_DELIVERY_PLAN_SHEET}'",
+        )
+    if not completion_date:
+        add_project_error(
+            all_errors,
+            project_name,
+            f"Final Delivery Date missing in Charter sheet worksheet '{CHARTER_PROJECT_DELIVERY_PLAN_SHEET}'",
+        )
+
+    return start_date, completion_date
+
 def get_bd_date():
     bd_tz = pytz.timezone("Asia/Dhaka")
     bd_now = datetime.now(bd_tz)
@@ -1914,6 +1953,7 @@ def build_daily_project_progress_rows(today_activity_df, member_lookup):
             "Snapshot Time": snapshot_time,
             "Project Name": clean_sheet_text(activity_row.get("Project Name", "")),
             "Start Date": clean_sheet_text(activity_row.get("Start Date", "")),
+            "Completion Date": clean_sheet_text(activity_row.get("Completion Date", "")),
             "Ticket Status": clean_sheet_text(activity_row.get("Ticket Status", "")),
             "QAI ID": qai_id,
             "Full Name": clean_sheet_text(
@@ -1971,6 +2011,24 @@ def get_daily_project_progress_context(all_errors=None, project_name=""):
         return sh, ws, pd.DataFrame(columns=DAILY_PROJECT_PROGRESS_HEADERS)
 
     header = [clean_sheet_text(col) for col in data[0]]
+    if header == LEGACY_DAILY_PROJECT_PROGRESS_HEADERS:
+        completion_date_col = header.index("Start Date") + 2  # gspread uses 1-based columns
+        ws.insert_cols(
+            [["Completion Date"]],
+            col=completion_date_col,
+            value_input_option="USER_ENTERED",
+        )
+        data = read_worksheet_values(
+            ws,
+            project_name=project_name or "Local Resource Pool",
+            sheet_name=DAILY_PROJECT_PROGRESS_SHEET,
+        )
+        header = [clean_sheet_text(col) for col in data[0]]
+        log(
+            f"✅ Inserted Completion Date after Start Date in "
+            f"{DAILY_PROJECT_PROGRESS_SHEET}; existing rows were shifted intact."
+        )
+
     if header != DAILY_PROJECT_PROGRESS_HEADERS:
         existing_records = worksheet_values_to_records(data)
         progress_df = pd.DataFrame(existing_records)
@@ -2124,7 +2182,6 @@ def main():
             pdl_email = get_custom_field_value(task, "PDL Email")
             pdl = get_custom_field_value(task, "PDL")
             delivery_lead = get_custom_field_value(task, "Delivery Lead")
-            start_date = get_task_start_date(task)
             pdl_for_ignore = pdl_email or pdl
 
             project_audit_context[project_name] = {
@@ -2176,11 +2233,18 @@ def main():
 
             qai_id_and_status_map = None
             qai_id_name_map = {}
+            start_date = ""
+            completion_date = ""
             if charter_url:
                 qai_id_and_status_map, qai_id_name_map, all_errors = get_qai_id_and_status_pair(
                     charter_url=charter_url,
                     project_name=project_name,
                     all_errors=all_errors
+                )
+                start_date, completion_date = get_charter_project_dates(
+                    charter_url=charter_url,
+                    project_name=project_name,
+                    all_errors=all_errors,
                 )
             else:
                 add_project_error(
@@ -2226,6 +2290,7 @@ def main():
             activity_report_df["Client Alias"] = client_alias
             activity_report_df["Project Name"] = project_name
             activity_report_df["Start Date"] = start_date
+            activity_report_df["Completion Date"] = completion_date
             activity_report_df["Task Tracker Link"] = tracker_url
             activity_report_df["Ticket Status"] = clickup_status
 
