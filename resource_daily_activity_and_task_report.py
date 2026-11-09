@@ -38,7 +38,8 @@ MAX_SHEETS_RETRIES = 5
 
 load_dotenv()
 
-CLICKUP_API_TOKEN = None
+WORQCIRCLE_API_KEY = None
+WORQCIRCLE_API_ENDPOINT = "https://dv3rilzwfskd8.cloudfront.net"
 GOOGLE_SERVICE_ACCOUNT_JSON = None
 AUDIT_SHEET_URL = None
 LOCAL_RESOURCE_POOL_URL = None
@@ -55,8 +56,8 @@ AUDIT_LOG_HEADERS = [
     "Run ID",
     "Run Timestamp UTC",
     "Project",
-    "ClickUp Status",
-    "ClickUp Task URL",
+    "Project Status",
+    "Project URL",
     "Charter URL",
     "Task Tracker URL",
     "PDL",
@@ -164,7 +165,7 @@ def normalize_service_account_json(value):
         return text
 
 def load_runtime_config():
-    global CLICKUP_API_TOKEN
+    global WORQCIRCLE_API_KEY, WORQCIRCLE_API_ENDPOINT
     global GOOGLE_SERVICE_ACCOUNT_JSON
     global AUDIT_SHEET_URL
     global LOCAL_RESOURCE_POOL_URL
@@ -173,7 +174,8 @@ def load_runtime_config():
     global RESOURCE_LOOKUP_TAB
     global SERVICE_ACCOUNT_EMAIL
 
-    CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN")
+    WORQCIRCLE_API_KEY = os.getenv("WORQCIRCLE_API_KEY")
+    WORQCIRCLE_API_ENDPOINT = (os.getenv("WORQCIRCLE_API_ENDPOINT") or WORQCIRCLE_API_ENDPOINT).rstrip("/")
     GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     AUDIT_SHEET_URL = os.getenv("AUDIT_SHEET_URL")
     LOCAL_RESOURCE_POOL_URL = os.getenv("LOCAL_RESOURCE_POOL_URL")
@@ -196,7 +198,8 @@ def load_runtime_config():
         SERVICE_ACCOUNT_EMAIL = ""
 
     required_env = {
-        "CLICKUP_API_TOKEN": CLICKUP_API_TOKEN,
+        "WORQCIRCLE_API_KEY": WORQCIRCLE_API_KEY,
+        "LOCAL_RESOURCE_POOL_URL": LOCAL_RESOURCE_POOL_URL,
         "GOOGLE_SERVICE_ACCOUNT_JSON or service_account.json": GOOGLE_SERVICE_ACCOUNT_JSON,
         "AUDIT_SHEET_URL": AUDIT_SHEET_URL,
     }
@@ -451,8 +454,8 @@ def write_audit_log(all_errors):
             "Run ID": run_id,
             "Run Timestamp UTC": run_time,
             "Project": project_name,
-            "ClickUp Status": str(context.get("clickup_status", "")).strip(),
-            "ClickUp Task URL": clean_sheet_text(context.get("clickup_task_url", "")),
+            "Project Status": str(context.get("project_status", "")).strip(),
+            "Project URL": clean_sheet_text(context.get("project_url", "")),
             "Charter URL": clean_sheet_text(context.get("charter_url", "")),
             "Task Tracker URL": clean_sheet_text(context.get("tracker_url", "")),
             "PDL": str(context.get("pdl", "")).strip(),
@@ -491,6 +494,7 @@ def write_audit_log(all_errors):
             if history_header != AUDIT_LOG_HEADERS:
                 # Preserve prior history while upgrading the log schema.
                 history_df = pd.DataFrame(history_values[1:], columns=history_header)
+                history_df = history_df.rename(columns={"ClickUp Status": "Project Status", "ClickUp Task URL": "Project URL"})
                 for column in AUDIT_LOG_HEADERS:
                     if column not in history_df.columns:
                         history_df[column] = ""
@@ -618,62 +622,84 @@ def get_local_resource_pool_context(all_errors=None, project_name=""):
     return ws, headers, df, header_row_idx, resolved_pool_columns, qai_project_row_map, qai_first_row_map, qai_blank_project_row_map
 
 # ============================================================
-# CLICKUP FETCH
+# WORQCIRCLE FETCH
 # ============================================================
-
-LIST_ID = "900201326056"
-TRACKER_FIELD_NAME = "Task/Progress Tracker"
-CHARTER_FIELD_NAME = "Project Charter Link"
-
 
 TARGET_STATUS_NAMES = [
     "project received",
     "project in progress",
     "pending schedule approval",
 ]
-
-TARGET_STATUS_NAME_SET = {status.strip().lower() for status in TARGET_STATUS_NAMES}
+TARGET_STATUS_NAME_SET = set(TARGET_STATUS_NAMES)
 WORKED_CHARTER_STATUS_SET = {"active", "inactive", "offboarded"}
 
-def fetch_clickup_tasks():
-    headers = {"Authorization": CLICKUP_API_TOKEN}
-    tasks = []
-    page = 0
 
+def normalize_project_status(value):
+    return re.sub(r"[\s_-]+", " ", normalize_field_value(value)).strip().lower()
+
+
+def fetch_worqcircle_projects():
+    """Read every analytics page; fail before sheet writes on incomplete responses."""
+    projects = []
+    seen_ids = set()
+    skip = 0
+    limit = 10
     while True:
-        r = requests.get(
-            f"https://api.clickup.com/api/v2/list/{LIST_ID}/task",
-            headers=headers,
-            params={
-                "page": page,
-                "include_closed": True,
-                "include_archived": True,
-            },
+        response = requests.get(
+            f"{WORQCIRCLE_API_ENDPOINT}/api/v1/project-drawer/external/analytics",
+            headers={"x-api-key": WORQCIRCLE_API_KEY, "Accept": "application/json"},
+            params={"limit": limit, "skip": skip},
             timeout=30,
         )
-
-        if r.status_code != 200:
-            log(f"❌ ClickUp error: {r.text}")
-            sys.exit(1)
-
-        batch = r.json().get("tasks", [])
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("projectDrawers"), list):
+            raise ValueError("Invalid Worqcircle response: expected projectDrawers list")
+        batch = payload["projectDrawers"]
+        total = payload.get("filteredTotalCount", payload.get("count"))
+        if total is not None and (not isinstance(total, int) or total < 0):
+            raise ValueError("Invalid Worqcircle project count")
         if not batch:
+            if total is not None and skip < total:
+                raise ValueError("Worqcircle pagination ended before all projects were fetched")
             break
+        for project in batch:
+            if not isinstance(project, dict) or not project.get("_id") or not project.get("project_drawer_name"):
+                raise ValueError("Invalid Worqcircle project: missing ID or name")
+            if project["_id"] in seen_ids:
+                raise ValueError("Worqcircle pagination returned a duplicate project")
+            seen_ids.add(project["_id"])
+        projects.extend(batch)
+        skip += len(batch)
+        if total is not None and skip >= total:
+            break
+        # Without a total, continue until an empty page, even after a short page.
+    log(f"✅ Total Worqcircle projects fetched: {len(projects)}")
+    return projects
 
-        tasks.extend(batch)
-        page += 1
 
-    log(f"✅ Total ClickUp projects fetched: {len(tasks)}")
-    return tasks
+def build_charter_activity_report(status_map, name_map):
+    """Tracker metrics are unknown while tracker fetching is disabled."""
+    return pd.DataFrame([
+        {
+            "QAI ID": qai_id,
+            "Full Name": name_map.get(qai_id, ""),
+            "Engagement (today)": status,
+            "Charter Team Status": status,
+            **{column: "" for column in CLEAR_IF_NOT_RUNNING_HEADERS},
+        }
+        for qai_id, status in status_map.items()
+    ], columns=["QAI ID", "Full Name", "Engagement (today)", "Charter Team Status", *CLEAR_IF_NOT_RUNNING_HEADERS])
+
 
 def filter_tasks_for_test_run(tasks):
     if not PROJECT_NAME_FILTER:
-        log("ℹ️ PROJECT_NAME_FILTER is empty. Processing all matching ClickUp projects.")
+        log("ℹ️ PROJECT_NAME_FILTER is empty. Processing all matching Worqcircle projects.")
         return tasks
 
     filtered_tasks = [
         task for task in tasks
-        if str(task.get("name", "")).strip().lower() == PROJECT_NAME_FILTER.lower()
+        if str(task.get("project_drawer_name", "")).strip().lower() == PROJECT_NAME_FILTER.lower()
     ]
 
     log(
@@ -2077,10 +2103,10 @@ def append_daily_project_progress(today_activity_df, all_errors=None, project_na
 
 def resolve_latest_member_ticket_status(row, project_status_by_name):
     project_name = clean_sheet_text(row.get("Project Name", ""))
-    clickup_status = clean_sheet_text(project_status_by_name.get(project_name, ""))
+    project_status = clean_sheet_text(project_status_by_name.get(project_name, ""))
 
-    if clickup_status:
-        return clickup_status
+    if project_status:
+        return project_status
 
     return "Not Available"
 
@@ -2154,163 +2180,67 @@ def refresh_latest_member_status_sheet(project_status_by_name=None, all_errors=N
 
 
 def main():
-    global resource_type_map,gs_client
-
     load_runtime_config()
-    authenticate_google()
-
-    all_tasks = filter_tasks_for_test_run(fetch_clickup_tasks())
-    tasks = [
-        task for task in all_tasks
-        if normalize_field_value(task.get("status", {}).get("status")).strip().lower() in TARGET_STATUS_NAME_SET
+    # Complete the project fetch before authenticating or changing Google Sheets.
+    all_projects = filter_tasks_for_test_run(fetch_worqcircle_projects())
+    projects = [
+        project for project in all_projects
+        if normalize_project_status(project.get("project_status")) in TARGET_STATUS_NAME_SET
     ]
-    resource_type_map = load_resource_type_lookup()
-
+    authenticate_google()
     all_errors = []
     project_status_by_name = {
-        clean_sheet_text(task.get("name", "")): normalize_field_value(task.get("status", {}).get("status"))
-        for task in all_tasks
-        if clean_sheet_text(task.get("name", ""))
+        clean_sheet_text(project["project_drawer_name"]): normalize_project_status(project.get("project_status"))
+        for project in all_projects
     }
-
-    total_projects = len(tasks)
-
     try:
-        for index, task in enumerate(tqdm(tasks, desc="Processing Projects"), start=1):
-            project_name = task.get("name")
-            clickup_status = normalize_field_value(task.get("status", {}).get("status"))
-            pdl_email = get_custom_field_value(task, "PDL Email")
-            pdl = get_custom_field_value(task, "PDL")
-            delivery_lead = get_custom_field_value(task, "Delivery Lead")
-            pdl_for_ignore = pdl_email or pdl
-
+        for project in tqdm(projects, desc="Processing Projects"):
+            project_name = clean_sheet_text(project["project_drawer_name"])
+            status = normalize_project_status(project.get("project_status"))
+            # Use emails explicitly: normalize_field_value prefers names for user objects.
+            pdl_users = project.get("pdl") or []
+            pdl_email = ", ".join(user.get("email", "") for user in pdl_users if isinstance(user, dict))
+            charter_url = clean_sheet_text(project.get("projectCharterLink", ""))
+            client_alias = clean_sheet_text(project.get("client_alias", ""))
             project_audit_context[project_name] = {
-                "clickup_status": clickup_status,
-                "clickup_task_url": task.get("url", ""),
-                "pdl": pdl_email or pdl,
-                "delivery_lead": delivery_lead,
-            }
-
-            if should_ignore_project_by_pdl_email(pdl_for_ignore):
-                log(
-                    f"⏭️ Skipping project {index}/{total_projects}: {project_name} "
-                    f"(ignored PDL email: {pdl_for_ignore})"
-                )
-                continue
-
-            log(f"▶️ Processing project {index}/{total_projects}: {project_name}")
-
-            charter_url = None
-            tracker_url = None
-            client_alias = ""
-
-            for f in task.get("custom_fields", []):
-                if f.get("name") == CHARTER_FIELD_NAME:
-                    charter_url = f.get("value")
-                if f.get("name") == TRACKER_FIELD_NAME:
-                    tracker_url = f.get("value")
-                if f.get("name") == "Client Alias":
-                    client_alias = f.get("value") or ""
-
-            project_audit_context[project_name].update({
+                "project_status": status,
+                "project_url": "",
+                "pdl": pdl_email or normalize_field_value(pdl_users),
+                "delivery_lead": normalize_field_value(project.get("deliveryLead")),
                 "charter_url": charter_url,
-                "tracker_url": tracker_url,
-            })
-
-            fields_to_check = {
-                "charter_url": charter_url,
-                "tracker_url": tracker_url,
-                "client_alias": client_alias,
+                "tracker_url": "",
             }
-
-            all_errors.extend(
-                find_missing_fields(
-                    project_name=project_name,
-                    fields_to_check=fields_to_check
-                    )
-
-            )
-
-            qai_id_and_status_map = None
-            qai_id_name_map = {}
-            start_date = ""
-            completion_date = ""
-            if charter_url:
-                qai_id_and_status_map, qai_id_name_map, all_errors = get_qai_id_and_status_pair(
-                    charter_url=charter_url,
-                    project_name=project_name,
-                    all_errors=all_errors
-                )
-                start_date, completion_date = get_charter_project_dates(
-                    charter_url=charter_url,
-                    project_name=project_name,
-                    all_errors=all_errors,
-                )
-            else:
-                add_project_error(
-                    all_errors,
-                    project_name,
-                    "Skipped charter parsing because charter_url is missing",
-                )
-
-            if not tracker_url:
-                add_project_error(
-                    all_errors,
-                    project_name,
-                    "Skipped tracker processing because tracker_url is missing",
-                )
+            if should_ignore_project_by_pdl_email(pdl_email):
+                log(f"⏭️ Skipping project: {project_name} (ignored PDL email)")
                 continue
-
-            if qai_id_and_status_map is None:
-                add_project_error(
-                    all_errors,
-                    project_name,
-                    "Skipped tracker processing because charter data could not be loaded",
-                )
-                continue
-
-            activity_report_df = get_tracker_data(
-                qai_id_and_status_map,
-                qai_id_name_map,
-                all_errors,
-                project_name,
-                tracker_url,
-            )
-            if activity_report_df is None:
-                continue
-
-            if activity_report_df.empty:
-                add_project_error(
-                    all_errors,
-                    project_name,
-                    "No activity rows were generated from the available tracker and charter data",
-                )
-                continue
-
-            activity_report_df["Client Alias"] = client_alias
-            activity_report_df["Project Name"] = project_name
-            activity_report_df["Start Date"] = start_date
-            activity_report_df["Completion Date"] = completion_date
-            activity_report_df["Task Tracker Link"] = tracker_url
-            activity_report_df["Ticket Status"] = clickup_status
-
-            append_daily_project_progress(
-                activity_report_df,
-                all_errors=all_errors,
+            log(f"▶️ Processing project: {project_name}")
+            all_errors.extend(find_missing_fields(
                 project_name=project_name,
+                fields_to_check={"charter_url": charter_url, "client_alias": client_alias},
+            ))
+            if not charter_url:
+                continue
+            status_map, name_map, all_errors = get_qai_id_and_status_pair(
+                charter_url=charter_url, project_name=project_name, all_errors=all_errors,
             )
-
-        refresh_latest_member_status_sheet(
-            project_status_by_name=project_status_by_name,
-            all_errors=all_errors,
-        )
+            if status_map is None:
+                continue
+            start_date, completion_date = get_charter_project_dates(
+                charter_url=charter_url, project_name=project_name, all_errors=all_errors,
+            )
+            activity_df = build_charter_activity_report(status_map, name_map)
+            if activity_df.empty:
+                continue
+            for column, value in {
+                "Client Alias": client_alias, "Project Name": project_name,
+                "Start Date": start_date, "Completion Date": completion_date,
+                "Task Tracker Link": "", "Ticket Status": status,
+            }.items():
+                activity_df[column] = value
+            append_daily_project_progress(activity_df, all_errors=all_errors, project_name=project_name)
+        refresh_latest_member_status_sheet(project_status_by_name=project_status_by_name, all_errors=all_errors)
     finally:
         write_audit_log(all_errors)
-
-
-
-
-            
 
 
 if __name__ == "__main__":

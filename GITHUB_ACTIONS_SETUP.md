@@ -24,7 +24,7 @@ Add these in:
 
 Required:
 
-- `CLICKUP_API_TOKEN`
+- `WORQCIRCLE_API_KEY`
 - `GOOGLE_SERVICE_ACCOUNT_JSON`
 - `AUDIT_SHEET_URL`
 - `LOCAL_RESOURCE_POOL_URL`
@@ -32,8 +32,7 @@ Required:
 Optional:
 
 - `PROJECT_NAME_FILTER`
-- `HIGHLIGHT_TRACKER_ERRORS`
-- `RESOURCE_LOOKUP_TAB`
+- Repository variable `WORQCIRCLE_API_ENDPOINT` (optional endpoint override)
 
 ## Secret Values
 
@@ -67,5 +66,9 @@ You can also run it manually from:
 ## Notes
 
 - The workflow uses in-memory caches only for the current run. This is safe for GitHub Actions.
-- The script still depends on Google Sheets and ClickUp being reachable from GitHub-hosted runners.
+- The script still depends on Google Sheets and Worqcircle being reachable from GitHub-hosted runners.
 - If a scheduled run is delayed slightly, that is normal for GitHub Actions cron.
+
+## Data sources
+
+Projects come from Worqcircle analytics. Task Tracker fetching is disabled; new snapshots contain Charter membership/status and blank tracker metrics. Add `WORQCIRCLE_API_KEY` to GitHub Actions secrets before the next run.

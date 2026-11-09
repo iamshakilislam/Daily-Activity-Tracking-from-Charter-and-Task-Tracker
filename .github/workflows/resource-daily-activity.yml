@@ -21,7 +21,8 @@ jobs:
     timeout-minutes: 60
 
     env:
-      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+      WORQCIRCLE_API_KEY: ${{ secrets.WORQCIRCLE_API_KEY }}
+      WORQCIRCLE_API_ENDPOINT: ${{ vars.WORQCIRCLE_API_ENDPOINT }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       AUDIT_SHEET_URL: ${{ secrets.AUDIT_SHEET_URL }}
       LOCAL_RESOURCE_POOL_URL: ${{ secrets.LOCAL_RESOURCE_POOL_URL }}
