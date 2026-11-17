@@ -9,11 +9,23 @@ import time
 import sys
 import json
 import base64
+from datetime import datetime, timezone, timedelta
+
+
+def log(msg):
+    timestamp = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=6))
+    ).strftime("%Y-%m-%d %H:%M:%S +06:00")
+    print(f"[{timestamp}] {msg}", flush=True)
+
+
+if __name__ == "__main__":
+    log("START: Resource daily activity report; loading Python dependencies...")
+
 import pytz
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from tempfile import NamedTemporaryFile
@@ -21,13 +33,10 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 from gspread.utils import rowcol_to_a1
 from collections import defaultdict
+from email.utils import parsedate_to_datetime
 
-# ============================================================
-# LOGGER
-# ============================================================
-
-def log(msg):
-    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
+if __name__ == "__main__":
+    log("Python dependencies loaded. Loading .env configuration...")
 
 READ_DELAY = 0.35  # Keep reads gentle while avoiding unnecessary latency
 MAX_SHEETS_RETRIES = 5
@@ -223,9 +232,11 @@ def authenticate_google():
             "https://www.googleapis.com/auth/drive",
         ]
 
+        log("Google: preparing service account credentials...")
         creds = ServiceAccountCredentials.from_json_keyfile_name(sa_path, scope)
         gs_client = gspread.authorize(creds)
 
+        log("Google: opening audit spreadsheet; waiting for Google Sheets response...")
         audit_sheet = gs_client.open_by_url(AUDIT_SHEET_URL)
 
         log("✅ Google authenticated")
@@ -625,17 +636,84 @@ def get_local_resource_pool_context(all_errors=None, project_name=""):
 # WORQCIRCLE FETCH
 # ============================================================
 
+def normalize_project_status(value):
+    return re.sub(r"[\s_-]+", " ", normalize_field_value(value)).strip().lower()
+
+
+# Actual project_status values from Worqcircle analytics, not ClickUp labels.
 TARGET_STATUS_NAMES = [
-    "project received",
-    "project in progress",
-    "pending schedule approval",
+    "project-received",
+    "in-Progress",
+    "pending-schedule-approval",
 ]
-TARGET_STATUS_NAME_SET = set(TARGET_STATUS_NAMES)
+TARGET_STATUS_NAME_SET = {normalize_project_status(status) for status in TARGET_STATUS_NAMES}
 WORKED_CHARTER_STATUS_SET = {"active", "inactive", "offboarded"}
 
 
-def normalize_project_status(value):
-    return re.sub(r"[\s_-]+", " ", normalize_field_value(value)).strip().lower()
+WORQCIRCLE_PAGE_SIZE = 100
+WORQCIRCLE_REQUEST_TIMEOUT = (10, 60)  # connect timeout, read timeout
+WORQCIRCLE_MAX_ATTEMPTS = 3  # initial request plus two retries
+WORQCIRCLE_PAGE_DELAY = 0.25
+WORQCIRCLE_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def worqcircle_retry_delay(response, attempt):
+    delay = 2 * (2 ** (attempt - 1))
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            server_delay = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                retry_date = parsedate_to_datetime(retry_after)
+                if retry_date.tzinfo is None:
+                    retry_date = retry_date.replace(tzinfo=timezone.utc)
+                server_delay = (retry_date - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                server_delay = 0
+        delay = max(delay, server_delay)
+    return delay
+
+
+def request_worqcircle_page(skip, limit, page):
+    """Retry transient failures on the same page without advancing the offset."""
+    for attempt in range(1, WORQCIRCLE_MAX_ATTEMPTS + 1):
+        request_started = time.monotonic()
+        log(
+            f"Worqcircle: page {page}, attempt {attempt}/{WORQCIRCLE_MAX_ATTEMPTS} "
+            f"(skip={skip}, limit={limit}; connect timeout=10s, read timeout=60s); waiting for API..."
+        )
+        response = None
+        try:
+            response = requests.get(
+                f"{WORQCIRCLE_API_ENDPOINT}/api/v1/project-drawer/external/analytics",
+                headers={"x-api-key": WORQCIRCLE_API_KEY, "Accept": "application/json"},
+                params={"limit": limit, "skip": skip},
+                timeout=WORQCIRCLE_REQUEST_TIMEOUT,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            reason = type(exc).__name__
+            if attempt == WORQCIRCLE_MAX_ATTEMPTS:
+                log(f"Worqcircle: page {page} failed after {attempt} attempts ({reason}); stopping before sheet updates.")
+                raise
+        else:
+            log(f"Worqcircle: page {page} HTTP {response.status_code} received in {time.monotonic() - request_started:.1f}s.")
+            if response.status_code not in WORQCIRCLE_RETRY_STATUSES:
+                response.raise_for_status()
+                return response
+            reason = f"HTTP {response.status_code}"
+            if attempt == WORQCIRCLE_MAX_ATTEMPTS:
+                log(f"Worqcircle: page {page} failed after {attempt} attempts ({reason}); stopping before sheet updates.")
+                response.raise_for_status()
+        delay = worqcircle_retry_delay(response, attempt)
+        if response is not None:
+            response.close()
+        # Avoid tying up the scheduled run for an excessive server cooldown.
+        # Abort rather than retry earlier than Retry-After permits.
+        if delay > 300:
+            raise RuntimeError(f"Worqcircle requests a cooldown of {delay:.0f}s; stopping. Retry later.")
+        log(f"Worqcircle: {reason}; retrying SAME page {page} in {delay:.1f}s...")
+        time.sleep(delay)
 
 
 def fetch_worqcircle_projects():
@@ -643,15 +721,16 @@ def fetch_worqcircle_projects():
     projects = []
     seen_ids = set()
     skip = 0
-    limit = 10
+    limit = WORQCIRCLE_PAGE_SIZE
+    started = time.monotonic()
+    page = 0
+    log(f"Worqcircle: fetching up to {limit} projects per request; page pause={WORQCIRCLE_PAGE_DELAY:.2f}s.")
     while True:
-        response = requests.get(
-            f"{WORQCIRCLE_API_ENDPOINT}/api/v1/project-drawer/external/analytics",
-            headers={"x-api-key": WORQCIRCLE_API_KEY, "Accept": "application/json"},
-            params={"limit": limit, "skip": skip},
-            timeout=30,
-        )
-        response.raise_for_status()
+        page += 1
+        if page > 1:
+            log(f"Worqcircle: pacing requests; waiting {WORQCIRCLE_PAGE_DELAY:.2f}s before next page...")
+            time.sleep(WORQCIRCLE_PAGE_DELAY)
+        response = request_worqcircle_page(skip, limit, page)
         payload = response.json()
         if not isinstance(payload, dict) or not isinstance(payload.get("projectDrawers"), list):
             raise ValueError("Invalid Worqcircle response: expected projectDrawers list")
@@ -671,8 +750,15 @@ def fetch_worqcircle_projects():
             seen_ids.add(project["_id"])
         projects.extend(batch)
         skip += len(batch)
+        log(f"Worqcircle: page {page} parsed; {len(batch)} projects received, {skip}/{total if total is not None else 'unknown'} fetched ({time.monotonic() - started:.1f}s elapsed).")
         if total is not None and skip >= total:
             break
+        if total is not None:
+            # Use actual batch size: the API may cap the requested limit.
+            remaining_pages = (max(0, total - skip) + len(batch) - 1) // len(batch)
+            average_page_seconds = (time.monotonic() - started) / page
+            eta = remaining_pages * (average_page_seconds + WORQCIRCLE_PAGE_DELAY)
+            log(f"Worqcircle: approximately {remaining_pages} requests left; estimated fetch time remaining {eta / 60:.1f} minutes at current speed.")
         # Without a total, continue until an empty page, even after a short page.
     log(f"✅ Total Worqcircle projects fetched: {len(projects)}")
     return projects
@@ -2114,7 +2200,7 @@ def resolve_latest_member_ticket_status(row, project_status_by_name):
 def resolve_latest_member_engagement(row):
     current_engagement = clean_sheet_text(row.get("Engagement (today)", ""))
     charter_status = clean_sheet_text(row.get("Charter Team Status", "")).lower()
-    ticket_status = clean_sheet_text(row.get("Ticket Status", "")).lower()
+    ticket_status = normalize_project_status(row.get("Ticket Status", ""))
 
     if current_engagement.lower() == "removed":
         return current_engagement
@@ -2180,23 +2266,32 @@ def refresh_latest_member_status_sheet(project_status_by_name=None, all_errors=N
 
 
 def main():
+    run_started = time.monotonic()
+    log("Configuration: validating required settings...")
     load_runtime_config()
+    log("Configuration validated. Task Tracker fetching is disabled.")
     # Complete the project fetch before authenticating or changing Google Sheets.
     all_projects = filter_tasks_for_test_run(fetch_worqcircle_projects())
     projects = [
         project for project in all_projects
         if normalize_project_status(project.get("project_status")) in TARGET_STATUS_NAME_SET
     ]
+    log(f"Project selection: {len(projects)}/{len(all_projects)} projects match target statuses: {', '.join(TARGET_STATUS_NAMES)}.")
+    status_counts = defaultdict(int)
+    for project in all_projects:
+        status_counts[clean_sheet_text(project.get("project_status")) or "(missing)"] += 1
+    log("Worqcircle status counts: " + "; ".join(f"{status}={count}" for status, count in sorted(status_counts.items())))
+    log("Google: authenticating and opening audit spreadsheet...")
     authenticate_google()
     all_errors = []
     project_status_by_name = {
-        clean_sheet_text(project["project_drawer_name"]): normalize_project_status(project.get("project_status"))
+        clean_sheet_text(project["project_drawer_name"]): clean_sheet_text(project.get("project_status"))
         for project in all_projects
     }
     try:
         for project in tqdm(projects, desc="Processing Projects"):
             project_name = clean_sheet_text(project["project_drawer_name"])
-            status = normalize_project_status(project.get("project_status"))
+            status = clean_sheet_text(project.get("project_status"))
             # Use emails explicitly: normalize_field_value prefers names for user objects.
             pdl_users = project.get("pdl") or []
             pdl_email = ", ".join(user.get("email", "") for user in pdl_users if isinstance(user, dict))
@@ -2220,11 +2315,13 @@ def main():
             ))
             if not charter_url:
                 continue
+            log(f"Charter: reading team membership for {project_name}...")
             status_map, name_map, all_errors = get_qai_id_and_status_pair(
                 charter_url=charter_url, project_name=project_name, all_errors=all_errors,
             )
             if status_map is None:
                 continue
+            log(f"Charter: {len(status_map)} eligible members; reading project dates for {project_name}...")
             start_date, completion_date = get_charter_project_dates(
                 charter_url=charter_url, project_name=project_name, all_errors=all_errors,
             )
@@ -2237,11 +2334,22 @@ def main():
                 "Task Tracker Link": "", "Ticket Status": status,
             }.items():
                 activity_df[column] = value
+            log(f"Upload: preparing and appending {len(activity_df)} progress rows for {project_name}...")
             append_daily_project_progress(activity_df, all_errors=all_errors, project_name=project_name)
+        log("Latest Member Status: rebuilding from progress history...")
         refresh_latest_member_status_sheet(project_status_by_name=project_status_by_name, all_errors=all_errors)
     finally:
+        log(f"Audit: writing {len(all_errors)} collected issue(s)...")
         write_audit_log(all_errors)
+    log(f"DONE: report completed in {time.monotonic() - run_started:.1f}s.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("STOPPED: interrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        log(f"FAILED: {type(exc).__name__}; see traceback below for details.")
+        raise

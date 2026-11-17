@@ -20,7 +20,7 @@ ClickUp credentials are no longer required. Keep credentials in local `.env` or 
 
 ## Project fetching and selection
 
-The script calls `GET /api/v1/project-drawer/external/analytics` with `x-api-key`, `Accept: application/json`, and `limit`/`skip` pagination. It reads `projectDrawers` and the `filteredTotalCount` (falling back to `count`). Invalid responses, duplicate projects, HTTP errors, and premature pagination termination stop the run before Google Sheets writes.
+The script calls `GET /api/v1/project-drawer/external/analytics` with `x-api-key`, `Accept: application/json`, and `limit`/`skip` pagination (100 projects requested per page, with a 0.25-second pause between pages; if the API returns fewer, the offset advances by the actual batch size). Connection timeout is 10 seconds; read timeout is 60 seconds. Timeouts, connection failures, and HTTP 429/500/502/503/504 are retried on the same page up to two times, waiting 2/4 seconds or longer if required by `Retry-After` (seconds or HTTP date). A server cooldown over 300 seconds stops the run instead of retrying early. Other HTTP errors, including 401/403, fail immediately. Each attempt and retry delay is logged. It reads `projectDrawers` and the `filteredTotalCount` (falling back to `count`). Invalid responses, duplicate projects, HTTP errors, and premature pagination termination stop the run before Google Sheets writes.
 
 Worqcircle field mapping:
 
@@ -33,7 +33,7 @@ Worqcircle field mapping:
 | `pdl[].email` | Ignored PDL matching and audit context |
 | `deliveryLead` | Audit delivery lead |
 
-Status normalization replaces hyphens and underscores with spaces and ignores case. Eligible statuses remain `project received`, `project in progress`, and `pending schedule approval`. The latest status view uses all fetched project statuses, including completed projects. Projects whose PDL emails match the existing ignore list are skipped.
+Status normalization replaces hyphens and underscores with spaces and ignores case. Eligible Worqcircle statuses are `project-received`, `in-Progress`, and `pending-schedule-approval`. Comparisons use normalized values; Ticket Status and audit output preserve the API spelling. `not-Started` and `demo-project-received` are outside the current target scope. The latest status view uses all fetched project statuses, including completed projects. Projects whose PDL emails match the existing ignore list are skipped.
 
 ## Charter and output behavior
 
@@ -59,3 +59,5 @@ python resource_daily_activity_and_task_report.py
 ```
 
 Running the script updates the configured Google Sheets. GitHub Actions runs it every hour at minute 40 and supports manual runs.
+
+For 2,222 projects, fetching takes 23 requests if the API honors a limit of 100. Deliberate pauses total 5.5 seconds; actual request times and retries are additional. Logs estimate remaining fetch time from observed throughput. Google Sheets processing is additional.
